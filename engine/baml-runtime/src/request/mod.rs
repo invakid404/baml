@@ -66,12 +66,22 @@ pub fn create_http_client(
                 .build()
                 .context("Failed to create reqwest client")
         } else {
-            // When no custom connect timeout is specified, return the shared
-            // global client.  This is critical for the ClientRegistry path where
-            // a new LLMProvider is created per request — without sharing, each
+            // Return the shared global client when the config matches defaults.
+            // This is critical for the ClientRegistry path where a new
+            // LLMProvider is created per request — without sharing, each
             // provider gets its own connection pool and we exhaust ephemeral
             // ports under sustained load.
-            if http_config.connect_timeout_ms.is_none() {
+            //
+            // The shared client uses a 10s connect timeout (see builder()).
+            // ensure_http_config() in helpers.rs always sets
+            // connect_timeout_ms = Some(10_000) as the default, so we must
+            // match on that value — not just None.
+            let uses_default_connect_timeout = matches!(
+                http_config.connect_timeout_ms,
+                None | Some(10_000)
+            );
+
+            if uses_default_connect_timeout {
                 return Ok(default_client().clone());
             }
 
@@ -82,7 +92,7 @@ pub fn create_http_client(
                 // See comment in builder() above for why pooling is re-enabled.
                 .pool_idle_timeout(Duration::from_secs(10));
 
-            // Apply connect timeout if specified
+            // Apply custom connect timeout
             // Note: 0 means infinite timeout (no timeout)
             if let Some(ms) = http_config.connect_timeout_ms {
                 if ms > 0 {
@@ -90,9 +100,6 @@ pub fn create_http_client(
                 }
                 // If ms == 0, don't set connect_timeout (infinite timeout)
             }
-
-            // Note: request_timeout is applied per-request, not on client
-            // We'll apply it when building individual requests
 
             builder.build().context("Failed to create reqwest client")
         }
