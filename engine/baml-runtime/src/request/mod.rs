@@ -14,14 +14,22 @@ fn builder() -> reqwest::ClientBuilder {
                 .connect_timeout(Duration::from_secs(10))
                 .danger_accept_invalid_certs(danger_accept_invalid_certs)
                 .http2_keep_alive_interval(Some(Duration::from_secs(10)))
-                // To prevent stalling in python, we set the pool to 0 and idle timeout to 0.
-                // See:
+                // Re-enable connection pooling with a short idle timeout.
+                //
+                // Previously pooling was disabled (pool_max_idle_per_host(0),
+                // pool_idle_timeout(1ns)) to work around hyper stalling bugs in
+                // Python's asyncio context.  However, disabling pooling means
+                // every request opens a new TCP connection which enters TIME_WAIT
+                // on close (~60s on Linux).  Under high concurrency this exhausts
+                // ephemeral ports, causing EADDRNOTAVAIL errors.
+                //
+                // A 10s idle timeout keeps connections alive long enough for
+                // reuse during bursts while still cleaning up aggressively.
+                //
+                // Original references (for context):
                 // https://github.com/seanmonstar/reqwest/issues/600
-                // https://github.com/denoland/deno/issues/28853
                 // https://github.com/hyperium/hyper/issues/2312
-                // https://github.com/Azure/azure-sdk-for-rust/pull/1550
-                .pool_max_idle_per_host(0)
-                .pool_idle_timeout(std::time::Duration::from_nanos(1))
+                .pool_idle_timeout(Duration::from_secs(10))
         }
     }
 }
@@ -44,14 +52,8 @@ pub fn create_http_client(
             let mut builder = reqwest::Client::builder()
                 .danger_accept_invalid_certs(danger_accept_invalid_certs)
                 .http2_keep_alive_interval(Some(Duration::from_secs(10)))
-                // To prevent stalling in python, we set the pool to 0 and idle timeout to 0.
-                // See:
-                // https://github.com/seanmonstar/reqwest/issues/600
-                // https://github.com/denoland/deno/issues/28853
-                // https://github.com/hyperium/hyper/issues/2312
-                // https://github.com/Azure/azure-sdk-for-rust/pull/1550
-                .pool_max_idle_per_host(0)
-                .pool_idle_timeout(std::time::Duration::from_nanos(1));
+                // See comment in builder() above for why pooling is re-enabled.
+                .pool_idle_timeout(Duration::from_secs(10));
 
             // Apply connect timeout if specified
             // Note: 0 means infinite timeout (no timeout)
