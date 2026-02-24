@@ -1,5 +1,23 @@
 use anyhow::{Context, Result};
+use std::sync::OnceLock;
 use web_time::Duration;
+
+/// Returns a shared `reqwest::Client` with default settings.
+///
+/// When `ClientRegistry` creates a new `LLMProvider` per request, each provider
+/// previously got its own `reqwest::Client` with its own TCP connection pool.
+/// Under high concurrency (100+ requests/s), this causes ephemeral port
+/// exhaustion because each client opens fresh connections that enter TIME_WAIT.
+///
+/// By sharing a single client, all providers reuse the same connection pool.
+fn default_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        builder()
+            .build()
+            .expect("Failed to create default reqwest client")
+    })
+}
 
 fn builder() -> reqwest::ClientBuilder {
     cfg_if::cfg_if! {
@@ -35,7 +53,7 @@ fn builder() -> reqwest::ClientBuilder {
 }
 
 pub fn create_client() -> Result<reqwest::Client> {
-    builder().build().context("Failed to create reqwest client")
+    Ok(default_client().clone())
 }
 
 pub fn create_http_client(
@@ -48,6 +66,15 @@ pub fn create_http_client(
                 .build()
                 .context("Failed to create reqwest client")
         } else {
+            // When no custom connect timeout is specified, return the shared
+            // global client.  This is critical for the ClientRegistry path where
+            // a new LLMProvider is created per request — without sharing, each
+            // provider gets its own connection pool and we exhaust ephemeral
+            // ports under sustained load.
+            if http_config.connect_timeout_ms.is_none() {
+                return Ok(default_client().clone());
+            }
+
             let danger_accept_invalid_certs = matches!(std::env::var("DANGER_ACCEPT_INVALID_CERTS").as_deref(), Ok("1"));
             let mut builder = reqwest::Client::builder()
                 .danger_accept_invalid_certs(danger_accept_invalid_certs)
@@ -57,7 +84,6 @@ pub fn create_http_client(
 
             // Apply connect timeout if specified
             // Note: 0 means infinite timeout (no timeout)
-            // Defaults were already applied during client creation
             if let Some(ms) = http_config.connect_timeout_ms {
                 if ms > 0 {
                     builder = builder.connect_timeout(Duration::from_millis(ms));
