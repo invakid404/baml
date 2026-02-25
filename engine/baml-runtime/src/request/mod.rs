@@ -13,6 +13,7 @@ use web_time::Duration;
 fn default_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
+        log::warn!("[reqwest-pool] initializing shared default reqwest::Client");
         builder()
             .build()
             .expect("Failed to create default reqwest client")
@@ -48,6 +49,8 @@ fn builder() -> reqwest::ClientBuilder {
                 // https://github.com/seanmonstar/reqwest/issues/600
                 // https://github.com/hyperium/hyper/issues/2312
                 .pool_idle_timeout(Duration::from_secs(10))
+                // Log connection establishment/reuse for diagnostics.
+                .connection_verbose(true)
         }
     }
 }
@@ -82,8 +85,17 @@ pub fn create_http_client(
             );
 
             if uses_default_connect_timeout {
+                log::debug!(
+                    "[reqwest-pool] returning shared client (connect_timeout_ms={:?})",
+                    http_config.connect_timeout_ms
+                );
                 return Ok(default_client().clone());
             }
+
+            log::debug!(
+                "[reqwest-pool] creating NEW client (connect_timeout_ms={:?})",
+                http_config.connect_timeout_ms
+            );
 
             let danger_accept_invalid_certs = matches!(std::env::var("DANGER_ACCEPT_INVALID_CERTS").as_deref(), Ok("1"));
             let mut builder = reqwest::Client::builder()
