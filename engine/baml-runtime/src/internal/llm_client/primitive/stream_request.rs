@@ -139,8 +139,6 @@ pub async fn make_stream_request(
                     }
                 }
             })
-            // Stop on Done or Error, but emit Error events first
-            .take_while(|event| std::future::ready(!matches!(event, StreamEventResult::Done)))
             .inspect(|event| log::debug!("{event:#?}"))
             .scan(
                 (
@@ -162,13 +160,26 @@ pub async fn make_stream_request(
                         },
                     }),
                     false, // has_emitted_error - to stop after emitting error
+                    false, // stream_done - [DONE] received, draining body for connection reuse
                 ),
-                move |(accumulated, has_emitted_error): &mut (
+                move |(accumulated, has_emitted_error, stream_done): &mut (
                     Result<LLMCompleteResponse>,
+                    bool,
                     bool,
                 ),
                       event| {
-                    // If we've already emitted an error, stop the stream
+                    // After [DONE], keep consuming eventsource events to drain the
+                    // underlying HTTP response body.  If we drop the stream before
+                    // the body reaches EOF, hyper cannot return the TCP connection
+                    // to the pool — it must close it, creating a TIME_WAIT socket.
+                    // Under sustained load this exhausts ephemeral ports.
+                    if *stream_done {
+                        return std::future::ready(Some(None));
+                    }
+
+                    // If we've already emitted a fatal (timeout) error, stop the
+                    // stream immediately.  Timeouts indicate the connection is
+                    // stuck, so draining would block.
                     if *has_emitted_error {
                         return std::future::ready(None);
                     }
@@ -176,8 +187,8 @@ pub async fn make_stream_request(
                     let event_body = match event {
                         StreamEventResult::Data(json) => json,
                         StreamEventResult::Done => {
-                            // Should not reach here due to take_while, but handle gracefully
-                            return std::future::ready(None);
+                            *stream_done = true;
+                            return std::future::ready(Some(None));
                         }
                         StreamEventResult::Error {
                             message,
@@ -195,7 +206,7 @@ pub async fn make_stream_request(
                             } else {
                                 ErrorCode::UnsupportedResponse(2)
                             };
-                            return std::future::ready(Some(LLMResponse::LLMFailure(
+                            return std::future::ready(Some(Some(LLMResponse::LLMFailure(
                                 LLMErrorResponse {
                                     client: client_name.clone(),
                                     model: model_name.clone(),
@@ -207,7 +218,7 @@ pub async fn make_stream_request(
                                     code,
                                     raw_response: None,
                                 },
-                            )));
+                            ))));
                         }
                     };
                     let update = match response_type {
@@ -265,14 +276,21 @@ pub async fn make_stream_request(
                         ),
                     };
                     if let Err(e) = update {
-                        std::future::ready(Some(LLMResponse::LLMFailure(e)))
+                        std::future::ready(Some(Some(LLMResponse::LLMFailure(e))))
                     } else {
                         match accumulated {
-                            Ok(v) => std::future::ready(Some(LLMResponse::Success(v.clone()))),
-                            Err(e) => std::future::ready(None),
+                            Ok(v) => std::future::ready(Some(Some(LLMResponse::Success(v.clone())))),
+                            Err(e) => {
+                                // Accumulation failed — stop emitting but still drain body
+                                *stream_done = true;
+                                std::future::ready(Some(None))
+                            },
                         }
                     }
                 },
-            ),
+            )
+            // Unwrap the Option layer: Some(response) → response, None → skip.
+            // The None items are emitted while draining the HTTP body after [DONE].
+            .filter_map(|item| std::future::ready(item)),
     ))
 }
